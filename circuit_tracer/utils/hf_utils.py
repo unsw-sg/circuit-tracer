@@ -195,7 +195,7 @@ def download_hf_uris(uris: Iterable[str], max_workers: int = 8) -> dict[str, str
     # ---  Pre-flight Check ---
     logger.info("Performing pre-flight metadata check...")
     unique_repos = {info.repo_id for info in parsed_map.values()}
-    # token = get_token()
+    token = get_token()
 
     # for repo_id in unique_repos:
     #     if hf_api.repo_info(repo_id=repo_id, token=token).gated is not False:
