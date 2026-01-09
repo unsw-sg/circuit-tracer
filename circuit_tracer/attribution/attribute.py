@@ -34,6 +34,49 @@ from circuit_tracer.utils.disk_offload import offload_modules
 
 
 @torch.no_grad()
+def compute_salient_alternative_logits(
+    logits: torch.Tensor,
+    required_logits: list[int],
+    unembed_proj: torch.Tensor,
+    *,
+    max_n_logits: int = 10,  # unused now, kept for interface compatibility
+    desired_logit_prob: float = 0.95,  # unused now, kept for interface compatibility
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    For the required_logits set, set their probability to 1 and all others to 0.
+    Discards the original logits/probs except for checking bounds on required_logits.
+
+    Args:
+        logits: ``(d_vocab,)`` vector (single position).
+        required_logits: list[int] -- vocab ids that must be included.
+        unembed_proj: ``(d_model, d_vocab)`` unembedding matrix.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            * logit_indices - ``(k,)`` vocabulary ids (the required_logits).
+            * logit_probs   - ``(k,)`` probabilities (all 1s, matching indices).
+            * demeaned_vecs - ``(k, d_model)`` unembedding columns, demeaned.
+    """
+    # Get required logits as unique tensor, filter out of range
+    if len(required_logits) == 0:
+        required_tensor = torch.empty(0, dtype=torch.long, device=logits.device)
+    else:
+        required_tensor = torch.tensor(
+            required_logits, dtype=torch.long, device=logits.device
+        ).unique()
+    valid_mask = (required_tensor >= 0) & (required_tensor < logits.shape[-1])
+    valid_required_tensor = required_tensor[valid_mask]
+
+    final_indices = valid_required_tensor
+    final_probs = torch.ones_like(
+        final_indices, dtype=logits.dtype, device=logits.device
+    )
+    cols = unembed_proj[:, final_indices]
+    demeaned = cols - unembed_proj.mean(dim=-1, keepdim=True)
+    return final_indices, final_probs, demeaned.T
+
+
+@torch.no_grad()
 def compute_salient_logits(
     logits: torch.Tensor,
     unembed_proj: torch.Tensor,
@@ -66,7 +109,9 @@ def compute_salient_logits(
     return top_idx, top_p, demeaned.T
 
 
-def compute_partial_influences(edge_matrix, logit_p, row_to_node_index, max_iter=128, device=None):
+def compute_partial_influences(
+    edge_matrix, logit_p, row_to_node_index, max_iter=128, device=None
+):
     """Compute partial influences using power iteration method."""
     device = device or get_default_device()
 
@@ -100,6 +145,7 @@ def attribute(
     offload: Literal["cpu", "disk", None] = None,
     verbose: bool = False,
     update_interval: int = 4,
+    required_logits: torch.Tensor | None = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt*.
 
@@ -167,6 +213,7 @@ def _run_attribution(
     offload_handles,
     logger,
     update_interval=4,
+    required_logits: torch.Tensor | None = None,
 ):
     start_time = time.time()
     # Phase 0: precompute
@@ -187,12 +234,16 @@ def _run_attribution(
     logger.info("Phase 1: Running forward pass")
     phase_start = time.time()
     with ctx.install_hooks(model):
-        residual = model.forward(input_ids.expand(batch_size, -1), stop_at_layer=model.cfg.n_layers)
+        residual = model.forward(
+            input_ids.expand(batch_size, -1), stop_at_layer=model.cfg.n_layers
+        )
         ctx._resid_activations[-1] = model.ln_final(residual)
     logger.info(f"Forward pass completed in {time.time() - phase_start:.2f}s")
 
     if offload:
-        offload_handles += offload_modules([block.mlp for block in model.blocks], offload)
+        offload_handles += offload_modules(
+            [block.mlp for block in model.blocks], offload
+        )
 
     # Phase 2: build input vector list
     logger.info("Phase 2: Building input vectors")
@@ -201,12 +252,21 @@ def _run_attribution(
     n_layers, n_pos, _ = activation_matrix.shape
     total_active_feats = activation_matrix._nnz()
 
-    logit_idx, logit_p, logit_vecs = compute_salient_logits(
-        ctx.logits[0, -1],
-        model.unembed.W_U,
-        max_n_logits=max_n_logits,
-        desired_logit_prob=desired_logit_prob,
-    )
+    if required_logits is not None:
+        logit_idx, logit_p, logit_vecs = compute_salient_alternative_logits(
+            ctx.logits[0, -1],
+            max_n_logits=max_n_logits,
+            desired_logit_prob=desired_logit_prob,
+            required_logits=required_logits,
+            unembed_proj=model.unembed.W_U,
+        )
+    else:
+        logit_idx, logit_p, logit_vecs = compute_salient_logits(
+            ctx.logits[0, -1],
+            model.unembed.W_U,
+            max_n_logits=max_n_logits,
+            desired_logit_prob=desired_logit_prob,
+        )
     logger.info(
         f"Selected {len(logit_idx)} logits with cumulative probability {logit_p.sum().item():.4f}"
     )
@@ -219,7 +279,9 @@ def _run_attribution(
     total_nodes = logit_offset + n_logits
 
     max_feature_nodes = min(max_feature_nodes or total_active_feats, total_active_feats)
-    logger.info(f"Will include {max_feature_nodes} of {total_active_feats} feature nodes")
+    logger.info(
+        f"Will include {max_feature_nodes} of {total_active_feats} feature nodes"
+    )
 
     edge_matrix = torch.zeros(max_feature_nodes + n_logits, total_nodes)
     # Maps row indices in edge_matrix to original feature/node indices
@@ -250,7 +312,11 @@ def _run_attribution(
     visited = torch.zeros(total_active_feats, dtype=torch.bool)
     n_visited = 0
 
-    pbar = tqdm(total=max_feature_nodes, desc="Feature influence computation", disable=not verbose)
+    pbar = tqdm(
+        total=max_feature_nodes,
+        desc="Feature influence computation",
+        disable=not verbose,
+    )
 
     while n_visited < max_feature_nodes:
         if max_feature_nodes == total_active_feats:
@@ -259,11 +325,17 @@ def _run_attribution(
             influences = compute_partial_influences(
                 edge_matrix[:st], logit_p, row_to_node_index[:st]
             )
-            feature_rank = torch.argsort(influences[:total_active_feats], descending=True).cpu()
-            queue_size = min(update_interval * batch_size, max_feature_nodes - n_visited)
+            feature_rank = torch.argsort(
+                influences[:total_active_feats], descending=True
+            ).cpu()
+            queue_size = min(
+                update_interval * batch_size, max_feature_nodes - n_visited
+            )
             pending = feature_rank[~visited[feature_rank]][:queue_size]
 
-        queue = [pending[i : i + batch_size] for i in range(0, len(pending), batch_size)]
+        queue = [
+            pending[i : i + batch_size] for i in range(0, len(pending), batch_size)
+        ]
 
         for idx_batch in queue:
             n_visited += len(idx_batch)
