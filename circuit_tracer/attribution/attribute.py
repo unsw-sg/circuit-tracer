@@ -22,7 +22,7 @@ https://transformer-circuits.pub/2025/attribution-graphs/methods.html
 
 import logging
 import time
-from typing import Literal
+from typing import Literal, List
 
 import torch
 from tqdm import tqdm
@@ -36,7 +36,7 @@ from circuit_tracer.utils.disk_offload import offload_modules
 @torch.no_grad()
 def compute_salient_alternative_logits(
     logits: torch.Tensor,
-    required_logits: list[int],
+    required_logits: List[int],
     unembed_proj: torch.Tensor,
     *,
     max_n_logits: int = 10,  # unused now, kept for interface compatibility
@@ -186,6 +186,7 @@ def attribute(
             max_n_logits=max_n_logits,
             desired_logit_prob=desired_logit_prob,
             batch_size=batch_size,
+            required_logits=required_logits,
             max_feature_nodes=max_feature_nodes,
             offload=offload,
             verbose=verbose,
@@ -213,7 +214,7 @@ def _run_attribution(
     offload_handles,
     logger,
     update_interval=4,
-    required_logits: torch.Tensor | None = None,
+    required_logits: List[int] | None = None,
 ):
     start_time = time.time()
     # Phase 0: precompute
